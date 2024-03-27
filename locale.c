@@ -1725,8 +1725,8 @@ S_posix_setlocale_with_complications(pTHX_ const int cat,
 
 #endif
 
-#define POSIX_SETLOCALE_LOCK      SETLOCALE_LOCK
-#define POSIX_SETLOCALE_UNLOCK    SETLOCALE_UNLOCK
+//#define POSIX_SETLOCALE_LOCK      SETLOCALE_LOCK
+//#define POSIX_SETLOCALE_UNLOCK    SETLOCALE_UNLOCK
 
 /* End of posix layer
  *==========================================================================
