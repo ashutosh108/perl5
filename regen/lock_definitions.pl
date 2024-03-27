@@ -25,10 +25,15 @@ my $comment_columns = $MAX_LINE_WIDTH - 3;  # For "/* " on first line; " * "
 my %conditionals;   # Accumulated list of functions that require restrictions
                     # on their input parameters to be thread-safe.
 my %functions;      # Accumulated data for each function in the input
+my %has_comments;   # Accumulated list of functions with comments at their
+                    # entries
 my %need_single_thread_init;    # Accumulated list of functions that need
                                 # single-thread initialization
 my %non_functions;  # Accumulated list of non-function inputs
+my %non_posixes;    # Accumulated list of functions not in POSIX
 my %obsoletes;      # Accumulated list of obsolete functions
+my %preferred;      # Accumulated list of functions which have preferred
+                    # alternatives
 my %race_tags;      # Accumulated tags for the input 'race:tag' elements
 my %signal_issues;  # Accumulated list of functions that are affected by signals
 my %unsuitables;    # Accumulated list of entirely thread-unsafe functions
@@ -45,26 +50,65 @@ sub open_print_header {
                       quote => $quote });
 }
 
+my $reentr_pl = "./regen/reentr.pl";
+open my $auto, "<", $reentr_pl or die "Can't open $reentr_pl: $!";
+while (<$auto>) {
+    last if /^__DATA__/;
+}
+
+my %automatics;
+while (<$auto>) {
+    my ($function, @rest) = split /\s*\|\s*/, $_;
+    $function =~ s/ \s .* //x;
+    my $reentrant = "${function}_r";
+    $automatics{$function} = $reentrant;
+}
+close $auto or die "Can't close $reentr_pl: $!";
+
 my $l = open_print_header('lock_definitions.h');
 print $l <<EOF;
 EOF
 
 sub name_order {    # sort helper
-    lc $a =~ s/_+//r cmp lc $b =~ s/_+//r;
+       lc $a =~ s/[\W_]*//gr cmp lc $b =~ s/[\W_]*//gr
+    or lc $a cmp lc $b;
 }
 
 my @DATA = <DATA>;
 close DATA;
 
 while (defined (my $line = shift @DATA)) {
-    chomp $line;
 
-    while ($line =~ s/ \s* \\ \s* $ //x) {
-        my $continuation .= shift @DATA;
-        chomp $continuation;
-        $continuation =~ s/ ^ \s+ / /x;
-        $line .= $continuation;
+    my (@cfunctions, @cdata);
+    {
+        do {
+            chomp $line;
+            $line =~ s/ \s+ $ //x;
+            my $continued = $line =~ s/ \s* \\ $ //x;
+            #print STDERR __FILE__, ": ", __LINE__, ": $continued: $line\n"; 
+            if ($line =~ / ^ ( [^|]* ) \s* \| \s* (.*) /x) {
+                push @cfunctions, $1;
+                push @cdata, $2;
+            }
+            elsif ($line =~ / ^ \S /x) {
+                push @cfunctions, $line;
+            }
+            else {
+            #print STDERR __FILE__, ": ", __LINE__, ": $continued: $line\n"; 
+                push @cdata, $line =~ s/ ^ \s+ //rx;
+            }
+
+            last unless $continued;
+
+            $line = shift @DATA;
+        } while (1);
     }
+
+            #print STDERR __FILE__, ": ", __LINE__, ": $line\n"; 
+    $line = join " ", @cfunctions;
+            #print STDERR __FILE__, ": ", __LINE__, ": $line\n", Dumper \@cdata; 
+    $line .= "|" . join " ", @cdata if @cdata ;#&& (@cdata > 1 || $cdata[0] ne "");
+            #print STDERR __FILE__, ": ", __LINE__, ": $line\n"; 
 
     my ($functions, $data, $dummy) = split /\s*\|\s*/, $line;
     croak("Extra '|' in input '$_'") if defined $dummy;
@@ -93,16 +137,21 @@ while (defined (my $line = shift @DATA)) {
         next;
     }
 
+    croak "line with only one column: '$line'" unless defined $data;
+
     # Fields in the data column
     my @categories;
     my @races;
     my @conditions;
     my @signals;
+    my $has_comment = 0;
     my @notes;
     my %locks;
     my $unsuitable;
     my $non_function = 0;
-    my $obsolete = 0;
+    my $non_posix = 0;
+    my $obsolete;
+    my $preferred;
     my $timer = 0;
     my $need_init = 0;
 
@@ -114,11 +163,19 @@ while (defined (my $line = shift @DATA)) {
             
         if ($data =~ s| // \s* ( .* ) $ ||x) {
             push @notes, "$1";
+            $has_comment = 1;
             next;
         }
 
         if ($data =~ s/ ^ U \b //x) {
             $unsuitable = "";
+            next;
+        }
+
+        if ($data =~ s/ ^ X \b //x) {
+            push @notes, "has never been in the POSIX Standard, or was removed"
+                       . " as of POSIX 2001";
+            $non_posix = 1;
             next;
         }
 
@@ -190,20 +247,41 @@ while (defined (my $line = shift @DATA)) {
             next;
         }
 
+        if ($data =~ s/ ^ O " ( [^"]+  ) " //x) {
+            $obsolete = $1;
+            unshift @notes, "Obsolete; $obsolete";
+            next;
+        }
+
         # The preferred functions (if any) follow the 'O'
-        if ($data =~ s/ O( [,\w]* ) //x) {
-            my @list = map { $_ .= "()" } split ",", $1;
-            my $note = "Obsolete";
+        if ($data =~ s/ ^ ( O | PF? ) ( [,\w]* ) //x) {
+            my $type = $1;
+
+            if ($type eq 'PF') {
+                $preferred = "a Perl $2-family macro";
+                unshift @notes, "Use $preferred instead";
+                next;
+            }
+
+            my @list = map { "$_()" } split ",", $2;
+            my $list = "";
             if (@list) {
                 $list[-1] = "or $list[-1]" if @list > 1;
-                $note .= "; use " . join ", ", @list;
-                $note =~ s/,// if @list == 2;
+                $list = join ", ", @list;
+                $list =~ s/,// if @list == 2;
             }
-            $note .= " instead";
 
-            unshift @notes, $note;
+            if ($type eq 'O') {
+                $obsolete = $list;
+                unshift @notes, "Obsolete";
+                $notes[0] .= "; use $list instead" if $obsolete;
+            }
+            elsif ($type eq 'P') {
+                $preferred = $list;
+                unshift @notes, "Use $list instead";
+            }
 
-            $obsolete = 1;
+            next;
         }
 
         croak("Unexpected input '$data'") if $data =~ /\S/;
@@ -248,14 +326,24 @@ while (defined (my $line = shift @DATA)) {
             $unsuitables{$function} = 1;
         }
 
-        if ($obsolete) {
-            $obsoletes{$function} = 1;
+        if (defined $obsolete) {
+            $obsoletes{$function} = $obsolete;
+        }
+
+        if (defined $preferred) {
+            $preferred{$function} = $preferred;
         }
 
         if ($non_function) {
             $entry{non_function} = 1;
             $non_functions{$function} = 1;
         }
+
+        if ($non_posix) {
+            $non_posixes{$function} = 1;
+        }
+
+        $has_comments{$function} = 1 if $has_comment || $non_posix;
             
         if (@races > 1 || (@races && $races[0] ne "")) {
             $race_tags{$_}{$function} = 1 for @races;
@@ -283,9 +371,9 @@ output_list_with_heading([ keys %functions ], <<EOT
  * that those accesses are thread-safe in a multi-threaded environment.
  *
  * Accesses are mostly function calls but there are a few macros and variables
- * as well.  Most accesses are already thread-safe without these wrappers, so
- * do not appear here.  The accesses that are known to have multi-thread
- * issues are:
+ * as well.  Most libc accesses are already thread-safe without these
+ * wrappers, so do not appear here.  The accesses that are known to have
+ * multi-thread issues are:
  *
 EOT
 );
@@ -296,23 +384,48 @@ output_list_with_heading([ keys %non_functions ], <<EOT
  * thread-safe on all platforms.  If your experience is otherwise, add an
  * entry in the DATA portion of $me.
  *
+ * If you use any of the above listed items, this file is for you.
+ *
  * All the accesses listed above are function calls, except for these:
  *
 EOT
 );
 
-output_list_with_heading([ keys %obsoletes ], <<EOT
+print $l <<EOT;
  *
  * A few functions are considered obsolete, and should not be used, at least
- * in new code.  These are:
+ * in new code.  Along with any preferred alternatives, these are:
  *
 EOT
-);
+
+sub output_columnarized_hash {
+    my ($handle, $hash_ref) = @_;
+
+    my $max_width = 0;
+
+    foreach my $function (keys $hash_ref->%*) {
+        my $width = length $function;
+        $max_width = $width if $width > $max_width
+    }
+    $max_width += 2;    # To allow for trailing "()"
+
+    foreach my $function (sort name_order keys $hash_ref->%*) {
+        printf $handle " * %-${max_width}s  %s\n",
+                       "$function()", $hash_ref->{$function};
+    }
+}
+
+output_columnarized_hash($l, \%obsoletes);
+
+foreach my $function (keys %unsuitables) {
+    my $prefix = (defined $preferred{$function}) ? '@' : " "; 
+    $unsuitables{"$prefix$function"} = delete $unsuitables{$function};
+}
 
 output_list_with_heading([ keys %unsuitables ], <<EOT
  *
- * Comments at their respective macro definitions below give any preferred
- * alternatives.
+ * More detailed information may be available at the #define entry for the
+ * respective lock below.
  *
  * A few functions are considered totally unsuited for use in a multi-thread
  * environment.  These must be called only during single-thread operation,
@@ -323,6 +436,10 @@ EOT
 );
 
 output_list_with_heading([ keys %need_single_thread_init, ], <<EOT
+ *
+ * There are preferred alternatives on some platforms for the functions marked
+ * with '\@' above, and which may be suitable for multi-thread use.  See below
+ * for the list of preferred alternatives.
  *
  * Some functions perform initialization on their first call that must be done
  * while still in a single-thread environment, but subsequent calls are
@@ -342,14 +459,14 @@ print $l <<EOT;
  * a global iterator for such a data base and that iterator is maintained by
  * libc, so that each new read from any thread advances it, meaning that no
  * thread will see all the entries.  The only way to make these thread-safe is
- * to have an exclusive lock on a mutex from the open call to the close.  This
- * is beyond the current scope of this header.  You are advised to not use
- * such databases from more than one thread at a time.  The LOCK macros here
- * only are designed to make the individual function calls thread-safe just
- * for the duration of the call.  Comments at each definition tell what other
- * functions have races with that function.  Typically the functions that fall
- * into this class have races with other functions whose names begin with
- * "end", such as "endgrent()".
+ * to have an exclusive lock on a mutex from the open call through the close.
+ * This is beyond the current scope of this header.  You are advised to not
+ * use such databases from more than one thread at a time.  The locking macros
+ * here only are designed to make the individual function calls thread-safe
+ * just for the duration of the call.  Comments at each definition tell what
+ * other functions have races with that function.  Typically the functions
+ * that fall into this class have races with other functions whose names begin
+ * with "end", such as "endgrent()".
  *
  * Other examples of functions that use a global state include pseudo-random
  * number generators.  Some libc implementations of 'rand()', for example, may
@@ -361,8 +478,8 @@ print $l <<EOT;
  *
  * When one thread does a chdir(2), it affects the whole process, and any libc
  * call that is expecting a stable working directory will be adversely
- * affected.  The man pages only list one such call, the obsolete nftw().
- * But there may be other issues lurking.
+ * affected.  The man pages only list one such call, nftw().  But there may
+ * be other issues lurking.
  *
  * Functions that output to a stream also are considered thread-unsafe when
  * locking is not done.  But the typical consequences are just that the data
@@ -386,8 +503,8 @@ EOT
 output_list_with_heading([ keys %signal_issues ], <<EOT
  *
  * The details on each restriction are documented below where their respective
- * macros are #defined.  The macros assume that the function is called with
- * the appropriate restrictions.
+ * locking macros are #defined.  The macros assume that the function is called
+ * with the appropriate restrictions.
  *
  * The macros here do not help in coping with asynchronous signals.  For
  * these, you need to see the vendor man pages.  The functions here known to
@@ -400,6 +517,117 @@ print $l <<EOT;
  *
  * Some libc's implement 'system()' thread-safely.  But in others, it also
  * has signal issues.
+ *
+ * There are better ways of accomplishing the same action for many of the
+ * functions.  This can be for various reasons, but the most common ones are
+ * either 1) there is an equivalent reentrant function with fewer (perhaps no)
+ * races; and/or 2) the function involves locales, and Perl doesn't expose the
+ * current underlying locale except within the scope of a "use locale"
+ * statement.  Using the perl-furnished macros and functions hides all that
+ * from you.
+ *
+ * Below is a list all such functions and their preferred alternatives.  Many
+ * of these can be automatically selected for you.  That is, if you use a
+ * function that has a preferred alternative, your code actually is compiled
+ * to transparently use the preferred alternative instead.  This feature is
+ * enabled by default for code in the Perl core and its extensions.  To enable
+ * it in other XS modules,
+ *
+ *    #define PERL_REENTRANT
+ *
+ * In the list below, the functions you always have to manually substitute the
+ * preferred version for are marked with an '\@'.  Unmarked ones get their
+ * preferred alternative automatically substituted for them when this feature
+ * is enabled.  For these, it is better to use the unpreferred version, and
+ * rely on this feature to do the right thing, in part because no substitution
+ * is done if the alternative is not available on the platform nor if threads
+ * aren't enabled.  You just write as if there weren't threads, and you get
+ * the better behavior without having to think about it.  You still should
+ * wrap your function calls with the locking macros #defined in this file.
+ * These also are automatically changed by this feature to use the macros for
+ * the selected alternative, which just might end up expanding to be a no-op.
+ *
+ * Even so, some of the preferred alternatives are considered obsolete or
+ * otherwise unwise to use.  These are marked with a '?', and you need to look
+ * elsewhere in this file for details.  Also, some alternatives aren't in the
+ * POSIX Standard or aren't Perl-defined functions, so won't be widely
+ * available.  These are marked with '~'.  (Remember that the automatic
+ * substitution only happens when they are available, so you can just use the
+ * unpreferred alternative.)
+ *
+ * If something you are using is on the list of problematic functions below,
+ * you should examine the comments where the locking macros for it are
+ * #defined.
+ *
+EOT
+
+my %curated_preferred;
+#print STDERR __FILE__, ": ", __LINE__, ": ", Dumper \%functions;#, \%race_tags;
+
+foreach my $bad (keys %automatics) {
+    my $better = $automatics{$bad};
+    if (! defined $functions{$better}) {
+        #print STDERR __FILE__, ": ", __LINE__, ": '$better'\n"; 
+    }
+
+    my $prefix = " ";
+    if (defined $obsoletes{$bad}) {
+        #print STDERR __FILE__, ": ", __LINE__, ": ", $better, "\n";
+        $prefix = "?";
+    }
+    elsif (defined $non_posixes{$better}) {
+        $prefix = "~";
+    }
+    elsif (defined $preferred{$bad}) {
+        if ($preferred{$bad} =~ s/\(\)//r eq $better) {
+            $prefix = " ";
+            delete $preferred{$bad};
+        }
+        else {
+            #print STDERR __FILE__, ": ", __LINE__, ": ", $preferred{$bad}, "\n";
+        }
+    }
+    else {
+        $prefix = "~";
+    }
+    $curated_preferred{" $bad"} = "$prefix$better()";
+}
+#print STDERR __FILE__, ": ", __LINE__, ": ", Dumper \%non_posixes;
+
+foreach my $bad (keys %preferred) {
+    my $better = $preferred{$bad};
+    my $prefix = (defined $non_posixes{$better}) ? '~' : " ";
+#    print STDERR __FILE__, ": ", __LINE__, ": $bad: $better";
+#    print STDERR " $non_posixes{$better}" if $non_posixes{$better};
+#    print STDERR "\n";
+    $curated_preferred{"\@$bad"} = "$prefix$better";
+}
+
+#print STDERR __FILE__, ": ", __LINE__, ": ", Dumper \%automatics;
+
+output_columnarized_hash($l, \%curated_preferred);
+
+output_list_with_heading([ keys %has_comments ], <<EOT
+ *
+ * And there are other functions that are problematic in some way other than
+ * those already given.  Please refer to their respective lock definitions
+ * below for any caveats (or more information) for functions in this list: 
+ *
+EOT
+);
+
+print $l <<EOT;
+ *
+ * In addition, the locale-related functions introduced in POSIX 2008 are not
+ * portable to platforms that don't support them; for example any Windows one.
+ * Perl has extensive code to hide the differences from your code.  You should
+ * be using Perl_setlocale() to change and query the locale; and don't use
+ * functions like uselocale(), or any function that takes a locale_t parameter
+ * (typically such functions have the suffix "_l" in their names).  Keep in
+ * mind that the current locale is assumed to be "C" for all Perl programs
+ * except within the scope of "use locale", or when calling certain functions
+ * in the POSIX module.  The perl core sorts all of this out for you; most
+ * functions that deal directly with locale information should not be used.
  *
  * In theory, you should wrap every instance of every function listed here
  * with its corresponding LOCK/UNLOCK macros, except as noted above.  The
@@ -418,11 +646,11 @@ print $l <<EOT;
  *
  * The macros here are generated from an internal DATA section in
  * $me, populated from information derived from the
- * POSIX 2017 Standard and Linux glibc section 3 man pages.  (Linux tends to
- * have extra restrictions not in the Standard, and its man pages are
- * typically more detailed than the Standard, and other vendors, who may also
- * have the same restrictions, but just don't document them.) The data can
- * easily be adjusted as necessary.
+ * POSIX 2017 Standard and Linux glibc section 3 man pages (supplemented by
+ * other vendor's man pages).  (Linux tends to have extra restrictions not in
+ * the Standard, and its man pages are typically more detailed than the
+ * Standard and other vendors, who may also have the same restrictions, but
+ * just don't document them.) The data can easily be adjusted as necessary.
  *
  * The macros generated here expand to other macro calls that are expected to
  * be #defined in perl.h, depending on the platform and Configuration.  Many
@@ -433,7 +661,7 @@ print $l <<EOT;
  * with each other unpredictably.  This header file currently lumps all races
  * and non-environment/locale vulnerabilities into a third, generic, mutex.
  * So the macro names are various combinations of the three mutexes, and
- * whether the lock needs to be exclusive (suffix "x" in the mutex name) or
+ * whether the lock needs to be exclusive (suffix "x" in the lock name) or
  * non-exclusive (suffix "r" for read-only).  GEN means the generic mutex; ENV
  * the environment one; and LC the locale one.
  *
@@ -479,20 +707,29 @@ EOT
 # The locale macros take a mask parameter with each affected category having a
 # bit set in it.  The mask for LC_ALL is the same across all platforms.
 print $l <<~EOT;
-    #define LC_ALLb_  LC_INDEX_TO_BIT_(LC_ALL_INDEX_)
-    EOT
 
-# On platforms where the locale for a given category must be matched by the
-# LC_CTYPE locale to avoid potential mojibake, set things up to also
-# automatically include the LC_CTYPE bit.
+/* The macros that include locale locking need to know (in some
+ * Configurations) which locale categories are affected.  This is done by
+ * passing a bit mask argument to them, with each affected category having a
+ * corresponding bit set.  The definitions below convert from category to its
+ * bit position. */
+#define LC_ALLb_  LC_INDEX_TO_BIT_(LC_ALL_INDEX_)
+EOT
+
 print $l <<~EOT;
 
-    #if defined(LC_CTYPE) && defined(PERL_MUST_DEAL_WITH_MISMATCHED_CTYPE)
-    #  define INCLUDE_CTYPE_  LC_INDEX_TO_BIT_(LC_CTYPE_INDEX_)
-    #else
-    #  define INCLUDE_CTYPE_  0
-    #endif
-    EOT
+/*  On platforms where the locale for a given category must be matched by the
+ *  LC_CTYPE locale to avoid potential mojibake, set things up to also
+ *  automatically include the LC_CTYPE bit. */
+#if defined(LC_CTYPE) && defined(PERL_MUST_DEAL_WITH_MISMATCHED_CTYPE)
+#  define INCLUDE_CTYPE_  LC_INDEX_TO_BIT_(LC_CTYPE_INDEX_)
+#else
+#  define INCLUDE_CTYPE_  0
+#endif
+
+/* Then #define the bit position for each category on the system that can play
+ * a part in the locking macro definitions */
+EOT
 
 # Create the mask for each category found in the DATA
 foreach my $cat (sort keys %categories) {
@@ -505,6 +742,11 @@ foreach my $cat (sort keys %categories) {
       #endif
       EOT
 }
+
+print $l <<~EOT;
+
+/* Then finally the locking macros */
+EOT
 
 # Output the computed results for each function in the DATA
 foreach my $function (sort name_order keys %functions) {
@@ -573,8 +815,8 @@ foreach my $function (sort name_order keys %functions) {
 
             if (keys %races_with) {
                 my $race_text =
-                    "${output_function_name}has races with other threads"
-                  . " concurrently executing";
+                    "${output_function_name}has potential races with other"
+                  . " threads concurrently executing";
                 my @race_names = sort name_order keys %races_with;
                 if (@race_names == 1) {
                     $race_text .= " either itself or " . $race_names[0];
@@ -591,8 +833,9 @@ foreach my $function (sort name_order keys %functions) {
         }
 
         if ($entry->{conditions}) {
-            push @comments, "$function() macros only valid if "
-                            . join ", ", $entry->{conditions}->@*;
+            push @comments, "$function() locking macros are only valid if '"
+                            . join(", ", $entry->{conditions}->@*)
+                            . "'";
         }
 
         # Ready to output any comments
@@ -749,7 +992,7 @@ if (%functions) {
 #       section of the Linux man pages the data is derived from.  This allows
 #       copy-pasting from those to here, with minimal changes, mostly
 #       deletions.  There may be continuation lines for these, as described
-#       below, none of which have a pipe character.
+#       below.
 #   2)  a non-continuation line beginning with the string " __END__" indicates
 #       it and anything past it to the end of the file are ignored.
 #   2)  non-continuation, entirely blank lines are ignored
@@ -766,36 +1009,67 @@ if (%functions) {
 # The other column gives the data, again in the form of the Linux man pages.
 # It applies to each function in the function list.  There are as many
 # blank-separated fields as necessary in the second column.  If the final
-# non-blank characters on the line are the character '\', the next input line
-# is a continuation of the data column, for as many such lines as end in '\'.
-# The following fields (appearing in any order, almost) are recognized:
+# non-blank character on the line is '\', the next input line is a
+# continuation line.
+#
+# If a continuation line contains the '|' character, the first portion of the
+# line continues the functions column, and the second portion the data column.
+# Otherwise, if the first character in the line is a blank, it continues the
+# data column; if non-blank, it continues the functions column.   Continuation
+# lines themselves may be continued, as many as necessary.
+#
+# The functions column may be continued even without a '\' character.  If the
+# final non-blank character in the functions list is a comma, the next line is
+# considered to be more functions, as many lines as necessary.
+
+# The data column contains the following fields (appearing in any order,
+# almost):
 #
 #   a)  Simply the character 'U'.  This indicates that the functions in the
-#       list are thread-unsafe, and therefore should not be used in
+#       functions column are thread-unsafe, and therefore should not be used in
 #       multi-thread mode.  The presence of this field precludes any other
 #       field but comment ones.
 #
-#   b)  The character 'M' means that the items in the list aren't functions,
-#       but macros.  The only current practical effect of this field is that
-#       each item is listed in the generated comments as not being a function.
+#   b)  The character 'M' means that the items in the functions column aren't
+#       actually functions, but macros.  The only current practical effect of
+#       this field is that each item is listed in the generated comments as
+#       not being a function.
 #
-#   c)  The character 'V' means that the items in the list aren't functions,
-#       but variables.  The only current practical effect of this field is
-#       that each item is listed in the generated comments as not being a
-#       function.
+#   c)  The character 'V' means that the items in the functions column aren't
+#       actually functions, but variables.  The only current practical effect
+#       of this field is that each item is listed in the generated comments as
+#       not being a function.
 #
-#   d)  The character 'O' followed by a comma-separated list of function
-#       names.  This means that the functions in the list are considered
-#       obsolete, and something from the comma-separated list should be used
-#       instead.
+#   d)  The character 'X' means that the functions in the functions column are
+#       non-Standard; they don't appear in any modern version of the POSIX
+#       Standard.
 #
-#   e)  The string "init".  This means that the functions in the list are
-#       unsafe the first time they are called, but after that can be made
-#       thread-safe by following the dictates of any remaining fields.  Hence
-#       these functions must be called at least once during single-thread
-#       startup.
+#   e)  The character 'O' or that character followed by either a double-quote
+#       enclosed "string" or a comma-separated list of function names.  This
+#       means that the functions in the functions column in the first field
+#       are considered obsolete.  If the 'O' stands alone, there is no simple
+#       replacement for the obsolete functions.  If the 'O' is followed by a
+#       comma-separated list, the list gives preferred alternatives that
+#       should be used instead.  The "string" is displayed literally for
+#       situations where a comma-separated list is inadequate.  "string" may
+#       not contain the '"' character internally.
 #
-#   f)  The string "sig:" followed by the name of a signal.  For example
+#   f)  The string "PF" followed by a name.  This means that the name is
+#       preferred over the functions (symbolized by the 'P'), and that it
+#       comes from a family (the 'F' means this) of Perl macros; 'name'
+#       indicates which family
+#
+#   g)  The character 'P', followed by a comma-separated list of function
+#       names (not beginning with 'F').  The functions in this list are
+#       preferred over the function in the first-field functions column .
+
+#   h)  The string "init".  This means that the functions in the functions
+#       column are unsafe the first time they are called, but after that can
+#       be made thread-safe by following the dictates of any remaining fields.
+#       Hence these functions must be called at least once during
+#       single-thread startup.
+#
+#   i)  The string "sig:" followed by the name of a signal.  For example
 #       "sig:ALRM".  This means the functions are vulnerable to the SIGALRM
 #       signal.  A list of all such functions is output in the comments at the
 #       top of the generated header file, and individually at the point of the
@@ -803,11 +1077,11 @@ if (%functions) {
 #       scope of this to automatically protect against these.  You'll have to
 #       figure it out on your own.
 #
-#   g)  The string "timer".  This appears to be obsolete, with sig:ALRM taking
+#   j)  The string "timer".  This appears to be obsolete, with sig:ALRM taking
 #       over its meaning.  The code here simply verifies that this string
 #       doesn't appear without also "sig:ALRM"
 #
-#   h)  Any other string of \w characters, none uppercase.  For example,
+#   k)  Any other string of \w characters, none uppercase.  For example,
 #       "env".  Each function whose data line contains this field
 #       non-atomically reads shared data of the same ilk.  So, in this case,
 #       "env" means that these functions read from data associated with
@@ -818,18 +1092,18 @@ if (%functions) {
 #       protected by a read-lock associated with the tag, so that no function
 #       that writes to that data can be concurrently executing.
 #
-#   i)  The string "const:" followed by a tag word (\w+).  This means that the
+#   l)  The string "const:" followed by a tag word (\w+).  This means that the
 #       affected functions write to shared data associated with the tag.
 #
 #       The implication is that these functions need to each have an
 #       exclusive lock associated with the tag, to avoid interference with
-#       other such functions, or the functions in h) that have the same tag.
+#       other such functions, or the functions in k) that have the same tag.
 #       Continuing the previous example, the function putenv() has
 #       "const:env".  This means it needs an exclusive lock on the mutex
 #       associated with "env", and all functions that contain just "env" for
 #       their data need read-locks on that mutex.
 #
-#   j)  The string "race".  This means that these each of these functions has
+#   m)  The string "race".  This means that these each of these functions has
 #       a potential race with something running in another thread.  If "race"
 #       appears alone, what the other thing(s) that can interfere with it are
 #       unspecified, but the generated header takes it as meaning the function
@@ -855,7 +1129,7 @@ if (%functions) {
 #       so that "ps" is non-NULL, and remove this cause of unsafety.  The
 #       generated macros assume that you do so.
 #
-#   k)  A string giving a locale category, like "LC_TIME".  This indicates
+#   n)  A string giving a locale category, like "LC_TIME".  This indicates
 #       what locale category affects the execution of this function.  Multiple
 #       ones may be specified.  These are for future use. XXX
 #
@@ -875,11 +1149,11 @@ if (%functions) {
 # to no-ops are automatically generated for the #else case.
 
 __DATA__
-addmntent  	| race:stream locale
-alphasort, versionsort| locale
+addmntent  	| race:stream locale X
+alphasort       | locale
 asctime  	| race:asctime locale  OPerl_sv_strftime_tm
 asctime_r  	| locale OPerl_sv_strftime_tm
-asprintf  	| locale
+asprintf, vasprintf| locale X
 atof  	        | locale
 atoi, atol, atoll| locale LC_NUMERIC
 btowc           | LC_CTYPE
@@ -892,13 +1166,10 @@ catgets         | race
 
 catopen  	| env LC_MESSAGES
 clearenv  	| const:env
-clearerr_unlocked,| race:stream                                             \
-                    // Is thread-safe if flockfile() or ftrylockfile() have \
-                       locked the stream, but should not be used since not  \
-                       standardized and not widely implemented
-fflush_unlocked,
-fgetc_unlocked,
-fgets_unlocked,
+clearerr_unlocked,| race:stream X                                           \
+fflush_unlocked,  | // Is thread-safe if flockfile() or ftrylockfile() have \
+fgetc_unlocked,   |    locked the stream, but should not be used since not  \
+fgets_unlocked,   |    standardized and not widely implemented
 fgetwc_unlocked,
 fgetws_unlocked,
 fputc_unlocked,
@@ -910,13 +1181,15 @@ fwrite_unlocked,
 getwc_unlocked,
 putwc_unlocked
 
-crypt_gensalt	| race:crypt_gensalt
+crypt_gensalt	| race:crypt_gensalt X
 crypt       	| race:crypt
+crypt_r       	| O
 
 #ifndef __GLIBC__
 ctermid         | race:ctermid/!s
 #endif
 
+ctermid_r       |
 ctime_r  	| race:tzset env locale LC_TIME OPerl_sv_strftime_ints
 ctime       	| race:tmbuf race:asctime race:tzset env locale LC_TIME     \
                   OPerl_sv_strftime_ints
@@ -944,7 +1217,7 @@ lrand48, mrand48,
 nrand48, seed48,
 srand48
 
-drand48_r,      | race:buffer
+drand48_r,      | race:buffer X
 erand48_r,
 jrand48_r,
 lcong48_r,
@@ -957,87 +1230,106 @@ srand48_r
 ecvt        	| race:ecvt Osnprintf
 
 encrypt, setkey | race:crypt
-endaliasent  	| locale
+endaliasent  	| locale X
 
-endfsent, 	| race:fsent
+endfsent, 	| race:fsent X
 setfsent
 
 endgrent, 	| race:grent locale
 setgrent
 
+endgrent_r, 	| race:grent locale O X
+setgrent_r
+
 endhostent, 	| race:hostent env locale
-gethostent_r,
 sethostent
 
+endhostent_r, 	| race:hostent env locale O X
+sethostent_r
+
 endnetent  	| race:netent env locale
-endnetgrent  	| race:netgrent
+endnetent_r  	| race:netent env locale O X
+
+endnetgrent  	| race:netgrent X
 
 endprotoent, 	| race:protoent locale
 setprotoent
 
+endprotoent_r, 	| race:protoent locale O X
+setprotoent_r
+
 endpwent,       | race:pwent locale
 setpwent
 
-endrpcent  	| locale
+endpwent_r,     | race:pwent locale O X
+setpwent_r
+
+endrpcent  	| locale X
 
 endservent, 	| race:servent locale
 setservent
 
-endspent, 	| race:getspent locale
+endservent_r, 	| race:servent locale O X
+setservent_r
+
+endspent, 	| race:getspent locale X
 getspent_r,
 setspent
 
-endttyent,      | race:ttyent
+endttyent,      | race:ttyent X
 getttyent,
 getttynam,
 setttyent
-endusershell  	| U
-endutent        | race:utent Oendutxent
+
+endusershell  	| U X
+endutent        | race:utent Oendutxent X
 endutxent       | race:utent
-err  	        | locale
-error_at_line  	| race:error_at_line/error_one_per_line locale
-error       	| locale
-errx        	| locale
-ether_aton  	| U
-ether_ntoa  	| U
-execlp, execvp, | env
-execvpe
+err  	        | locale X
+error_at_line  	| race:error_at_line/error_one_per_line locale X
+error       	| locale X
+errx        	| locale X
+ether_aton  	| U X
+ether_ntoa  	| U X
+
+execlp, execvp  | env
+execvpe         | env X
 
 exit        	| race:exit
 
-__fbufsize, 	| race:stream
+__fbufsize, 	| race:stream X
 __fpending,
 __fsetlocking
 
-__fpurge        | race:stream  // Not in POSIX Standard and not portable
+__fpurge        | race:stream X
 
-fcloseall  	| race:streams
+fcloseall  	| race:streams X
 fcvt        	| race:fcvt Osnprintf
-fgetgrent  	| race:fgetgrent
-fgetpwent  	| race:fgetpwent
-fgetspent  	| race:fgetspent
+fgetgrent  	| race:fgetgrent X
+fgetpwent  	| race:fgetpwent X
+fgetspent  	| race:fgetspent X
 fgetwc, getwc   | LC_CTYPE
 fgetws          | LC_CTYPE
 fnmatch  	| env locale
-forkpty, openpty| locale
+forkpty, openpty| locale X
 putwc, fputwc   | LC_CTYPE
 fputws          | LC_CTYPE
-fts_children  	| U
-fts_read  	| U
-ftw             | race  // Obsolete
+fts_children  	| U X
+fts_read  	| U X
+ftw             | race  Onftw
 
 fwscanf, swscanf,| locale LC_NUMERIC
 wscanf
 
-gammaf, gammal, | race:signgam
-gamma, lgammaf,
+gammaf, gammal  | race:signgam X 
+
+gamma, lgammaf, | race:signgam
 lgammal, lgamma
 
 getaddrinfo  	| env locale
-getaliasbyname_r| locale
-getaliasbyname  | U
-getaliasent_r  	| locale
-getaliasent  	| U
+getaliasbyname_r| locale X
+getaliasbyname  | U X Pgetaliasbyname_r
+getaliasent_r  	| locale X
+getaliasent  	| U X Pgetaliasent_r
 getc_unlocked   | race:stream  // Is thread-safe if flockfile() or      \
                                   ftrylockfile() have locked the stream
 getchar_unlocked| race:stdin  // Is thread-safe if flockfile() or       \
@@ -1045,8 +1337,8 @@ getchar_unlocked| race:stdin  // Is thread-safe if flockfile() or       \
 
 getcontext, setcontext| race:ucp
 
-get_current_dir_name | env
-getdate_r  	| env locale LC_TIME
+get_current_dir_name | env X
+getdate_r  	| env locale LC_TIME X
 getdate  	| race:getdate env locale LC_TIME
 
 // On platforms where the static buffer contained in getenv() is per-thread
@@ -1055,96 +1347,98 @@ getdate  	| race:getdate env locale LC_TIME
 // unlocked the mutex.  On such platforms (which is most), we can have many
 // readers of the environment at the same time.
 #ifdef GETENV_PRESERVES_OTHER_THREAD
-getenv, 	| env
-secure_getenv
+getenv 	        | env
+secure_getenv   | X env
 #else
 // If, on the other hand, another thread could zap our getenv() return, we
 // need to keep them from executing until we are done
-getenv, 	| race env
-secure_getenv
+getenv 	| race env
+secure_getenv   | X race env
 #endif
 
-getfsent, 	| race:fsent locale
+getfsent, 	| race:fsent locale X
 getfsfile,
 getfsspec
 
 getgrent  	| race:grent race:grentbuf locale
-getgrent_r  	| race:grent locale
+getgrent_r  	| race:grent locale X
 getgrgid  	| race:grgid locale
 getgrgid_r  	| locale
 getgrnam  	| race:grnam locale
 getgrnam_r  	| locale
-getgrouplist  	| locale
-gethostbyaddr_r | env locale
+getgrouplist  	| locale X
+gethostbyaddr_r | env locale X
 gethostbyaddr  	| race:hostbyaddr env locale Ogetaddrinfo                   \
                   // return needs a deep copy for safety
-gethostbyname2_r| env locale
-gethostbyname2  | race:hostbyname2 env locale
-gethostbyname_r | env locale
+gethostbyname2_r| env locale X
+gethostbyname2  | race:hostbyname2 env locale X
+gethostbyname_r | env locale X
 gethostbyname  	| race:hostbyname env locale Ogetnameinfo                   \
                   // return needs a deep copy for safety
 gethostent      | race:hostent race:hostentbuf env locale
+gethostent_r    | race:hostent env locale
 gethostid  	| hostid env locale
 getlogin  	| race:getlogin race:utent sig:ALRM timer locale
 getlogin_r  	| race:utent sig:ALRM timer locale
-getmntent_r  	| locale
-getmntent  	| race:mntentbuf locale
+getmntent_r  	| locale X
+getmntent  	| race:mntentbuf locale X
 getnameinfo  	| env locale
-getnetbyaddr_r  | locale
+getnetbyaddr_r  | locale X
 getnetbyaddr  	| race:netbyaddr locale
-getnetbyname_r  | locale
+getnetbyname_r  | locale X
 getnetbyname  	| race:netbyname env locale
-getnetent_r  	| locale
+getnetent_r  	| locale X
 getnetent  	| race:netent race:netentbuf env locale
-getnetgrent  	| race:netgrent race:netgrentbuf locale
+getnetgrent  	| race:netgrent race:netgrentbuf locale X
 
-getnetgrent_r, 	| race:netgrent locale
+getnetgrent_r, 	| race:netgrent locale X
 innetgr,
 setnetgrent
 
-getopt, 	| race:getopt env
-getopt_long,
+getopt  	| race:getopt env
+
+getopt_long,    | race:getopt env X
 getopt_long_only
 
-getpass  	| term  // Obsolete; DO NOT USE
-getprotobyname_r| locale
+getpass  	| term  O"DO NOT USE" X
+getprotobyname_r| locale X
 getprotobyname  | race:protobyname locale
-getprotobynumber_r| locale
+getprotobynumber_r| locale X
 getprotobynumber| race:protobynumber locale
-getprotoent_r  	| locale
+getprotoent_r  	| locale X
 getprotoent  	| race:protoent race:protoentbuf locale
 getpwent  	| race:pwent race:pwentbuf locale
-getpwent_r  	| race:pwent locale
-getpw       	| locale Ogetpwuid
+getpwent_r  	| race:pwent locale X
+getpw       	| locale Ogetpwuid X
 getpwnam_r  	| locale
 getpwnam  	| race:pwnam locale
 getpwuid_r  	| locale
 getpwuid  	| race:pwuid locale
-getrpcbyname_r  | locale
-getrpcbyname  	| U
-getrpcbynumber_r| locale
-getrpcbynumber  | U
-getrpcent_r  	| locale
-getrpcent  	| U
-getrpcport  	| env locale
-getservbyname_r | locale
+getrpcbyname_r  | locale X
+getrpcbyname  	| U X Pgetrpcbyname_r
+getrpcbynumber_r| locale X
+getrpcbynumber  | U X Pgetrpcbynumber_r
+getrpcent_r  	| locale X
+getrpcent  	| U X Pgetrpcent_r
+getrpcport  	| env locale X
+getservbyname_r | locale X
 getservbyname  	| race:servbyname locale
-getservbyport_r | locale
+getservbyport_r | locale X
 getservbyport  	| race:servbyport locale
-getservent_r  	| locale
+getservent_r  	| locale X
 getservent  	| race:servent race:serventbuf locale
-getspent  	| race:getspent race:spentbuf locale
-getspnam  	| race:getspnam locale
-getspnam_r  	| locale
-getusershell  	| U
-getutent        | init race:utent race:utentbuf sig:ALRM timer Ogetutxent
+getspent  	| race:getspent race:spentbuf locale X
+getspnam  	| race:getspnam locale X
+getspnam_r  	| locale X
+getusershell  	| U X
+getutent        | init race:utent race:utentbuf sig:ALRM timer Ogetutxent X
 getutxent       | init race:utent race:utentbuf sig:ALRM timer
-getutid         | init race:utent sig:ALRM timer
+getutid         | init race:utent sig:ALRM timer Ogetutxid X
 getutxid        | init race:utent sig:ALRM timer
-getutline  	| init race:utent sig:ALRM timer Ogetutxline
+getutline  	| init race:utent sig:ALRM timer Ogetutxline X
 getutxline  	| init race:utent sig:ALRM timer
 getwchar        | LC_CTYPE
-getwchar_unlocked| race:stdin                                               \
+getwchar_unlocked| race:stdin X                                             \
                     // Is thread-safe if flockfile() or ftrylockfile()      \
                        have locked stdin, but should not be used since not  \
                        standardized and not widely implemented
@@ -1159,67 +1453,69 @@ hcreate,  	| race:hsearch
 hdestroy,
 hsearch
 
-hcreate_r,      | race:htab      
+hcreate_r,      | race:htab X
 hsearch_r,
 hdestroy_r
 
 iconv_open  	| locale
 iconv       	| race:cd
 
-inet_aton, 	| locale
-inet_addr,
-inet_network,
+inet_addr,      | locale
 inet_ntoa
+
+inet_aton, 	| locale X
+inet_network
 
 inet_ntop  	| locale
 inet_pton  	| locale
-initgroups  	| locale
+initgroups  	| locale X
 
-initstate_r,    | race:buf
+initstate_r,    | race:buf X
 random_r,
 setstate_r,
 srandom_r
 
-iruserok_af  	| locale
-iruserok  	| locale
-isalpha         | LC_CTYPE  // Use a Perl isALPHA family macro instead
-isalnum         | LC_CTYPE  // Use a Perl isALNUM family macro instead
-isascii         | LC_CTYPE  // Considered obsolete as being non-portable    \
-                               by POSIX, but Perl makes it portable by using\
-                               an isASCII family macro
-isblank         | LC_CTYPE  // Use a Perl isBLANK family macro instead
-iscntrl         | LC_CTYPE  // Use a Perl isCNTRL family macro instead
-isdigit         | LC_CTYPE  // Use a Perl isDIGIT family macro instead
-isgraph         | LC_CTYPE  // Use a Perl isGRAPH family macro instead
-islower         | LC_CTYPE  // Use a Perl isLOWER family macro instead
-isprint         | LC_CTYPE  // Use a Perl isPRINT family macro instead
-ispunct         | LC_CTYPE  // Use a Perl isPUNCT family macro instead
-isspace         | LC_CTYPE  // Use a Perl isSPACE family macro instead
-isupper         | LC_CTYPE  // Use a Perl isUPPER family macro instead
-isxdigit        | LC_CTYPE  // Use a Perl isXDIGIT family macro instead
+iruserok_af  	| locale X
+iruserok  	| locale X
+isalpha         | LC_CTYPE PFisALPHA
+isalnum         | LC_CTYPE PFisALNUM
+isascii         | LC_CTYPE  PFisASCII                                       \
+                  // Considered obsolete as being non-portable, but Perl    \
+                     makes it portable when using a macro
+isblank         | LC_CTYPE PFisBLANK
+iscntrl         | LC_CTYPE PFisCNTRL
+isdigit         | LC_CTYPE PFisDIGIT
+isgraph         | LC_CTYPE PFisGRAPH
+islower         | LC_CTYPE PFisLOWER
+isprint         | LC_CTYPE PFisPRINT
+ispunct         | LC_CTYPE PFisPUNCT
+isspace         | LC_CTYPE PFisSPACE
+isupper         | LC_CTYPE PFisUPPER
+isxdigit        | LC_CTYPE PFisXDIGIT
 
 isalnum_l,      | LC_CTYPE
-isalpha_l, isascii_l,
+isalpha_l,
 isblank_l, iscntrl_l,
 isdigit_l, isgraph_l,
 islower_l, isprint_l,
 ispunct_l, isspace_l,
 isupper_l, isxdigit_l
+isascii_l       | LC_CTYPE X
 
-iswalpha         | locale LC_CTYPE  // Use a Perl isALPHA family macro instead
-iswalnum         | locale LC_CTYPE  // Use a Perl isALNUM family macro instead
-iswblank         | locale LC_CTYPE  // Use a Perl isBLANK family macro instead
-iswcntrl         | locale LC_CTYPE  // Use a Perl isCNTRL family macro instead
-iswdigit         | locale LC_CTYPE  // Use a Perl isDIGIT family macro instead
-iswgraph         | locale LC_CTYPE  // Use a Perl isGRAPH family macro instead
-iswlower         | locale LC_CTYPE  // Use a Perl isLOWER family macro instead
-iswprint         | locale LC_CTYPE  // Use a Perl isPRINT family macro instead
-iswpunct         | locale LC_CTYPE  // Use a Perl isPUNCT family macro instead
-iswspace         | locale LC_CTYPE  // Use a Perl isSPACE family macro instead
-iswupper         | locale LC_CTYPE  // Use a Perl isUPPER family macro instead
-iswxdigit        | locale LC_CTYPE  // Use a Perl isXDIGIT family macro instead
+iswalpha        | locale LC_CTYPE PFisALPHA
+iswalnum        | locale LC_CTYPE PFisALNUM
+iswblank        | locale LC_CTYPE PFisBLANK
+iswcntrl        | locale LC_CTYPE PFisCNTRL
+iswdigit        | locale LC_CTYPE PFisDIGIT
+iswgraph        | locale LC_CTYPE PFisGRAPH
+iswlower        | locale LC_CTYPE PFisLOWER
+iswprint        | locale LC_CTYPE PFisPRINT
+iswpunct        | locale LC_CTYPE PFisPUNCT
+iswspace        | locale LC_CTYPE PFisSPACE
+iswupper        | locale LC_CTYPE PFisUPPER
+iswxdigit       | locale LC_CTYPE PFisXDIGIT
 
-iswalnum_l,      | locale LC_CTYPE
+iswalnum_l,     | locale LC_CTYPE
 iswalpha_l, iswblank_l,
 iswcntrl_l, iswdigit_l,
 iswgraph_l, iswlower_l,
@@ -1228,31 +1524,30 @@ iswspace_l, iswupper_l,
 iswxdigit_l
 
 l64a  	        | race:l64a
-localeconv  	| race:localeconv locale LC_NUMERIC LC_MONETARY             \
-                  // Use Perl_localeconv() instead
+localeconv  	| race:localeconv locale LC_NUMERIC LC_MONETARY PPerl_localeconv
 localtime       | race:tmbuf race:tzset env locale
 localtime_r  	| race:tzset env locale
-login, logout  	| race:utent sig:ALRM timer  // Not in POSIX Standard
-login_tty  	| race:ttyname
-logwtmp  	| sig:ALRM timer  // Not in POSIX Standard
+login, logout  	| race:utent sig:ALRM timer X
+login_tty  	| race:ttyname X
+logwtmp  	| sig:ALRM timer X
 makecontext     | race:ucp
-mallinfo  	| init const:mallopt
+mallinfo  	| init const:mallopt X
 MB_CUR_MAX      | M LC_CTYPE
-mblen  	        | race LC_CTYPE
+mblen  	        | race LC_CTYPE Pmbrlen
 mbrlen  	| race:mbrlen/!ps LC_CTYPE
 mbrtowc         | LC_CTYPE race:mbrtowc/!ps
 mbsinit         | LC_CTYPE
 mbsnrtowcs  	| race:mbsnrtowcs/!ps LC_CTYPE
 mbsrtowcs  	| race:mbsrtowcs/!ps LC_CTYPE
 mbstowcs        | LC_CTYPE
-mbtowc          | race LC_CTYPE
+mbtowc          | race LC_CTYPE Pmbrtowc
 
-mcheck_check_all,| race:mcheck const:malloc_hooks
+mcheck_check_all,| race:mcheck const:malloc_hooks X
 mcheck_pedantic,
 mcheck, mprobe
 
 mktime  	| race:tzset env locale
-mtrace, muntrace| U
+mtrace, muntrace| U X
 nan, nanf, nanl | locale
 nftw        	| cwd   // chdir() in another thread will mess this up
 newlocale  	| env
@@ -1266,7 +1561,7 @@ dprintf, sprintf,
 snprintf, vprintf,
 vfprintf, vdprintf,
 vsprintf, vsnprintf
-profil  	| U
+profil  	| U X
 psiginfo  	| locale
 psignal  	| locale
 ptsname  	| race:ptsname
@@ -1276,75 +1571,82 @@ putchar_unlocked| race:stdout  // Is thread-safe if flockfile() or          \
                                   ftrylockfile() have locked stdin
 putenv  	| const:env
 putpwent  	| locale
-putspent  	| locale
-pututline       | race:utent sig:ALRM timer Opututxline
+putspent  	| locale X
+pututline       | race:utent sig:ALRM timer Opututxline X
 pututxline      | race:utent sig:ALRM timer
 putwchar        | LC_CTYPE
-putwchar_unlocked| race:stdout  // Is thread-safe if flockfile() or         \
-                                   ftrylockfile() have locked stdout, but   \
-                                   should not be used since not standardized\
-                                   and not widely implemented
-valloc, pvalloc | init
-qecvt  	        | race:qecvt Osnprintf
-qfcvt       	| race:qfcvt Osnprintf
+putwchar_unlocked| race:stdout X  // Is thread-safe if flockfile() or       \
+                                     ftrylockfile() have locked stdout, but \
+                                     should not be used since not           \
+                                     standardized and not widely implemented
+valloc, pvalloc | init X
+qecvt  	        | race:qecvt Osnprintf X
+qfcvt       	| race:qfcvt Osnprintf X
 
 #ifndef __GLIBC__
 rand            | // Problematic and should be avoided; See POSIX Standard
 #endif
 
-rcmd_af  	| U
-rcmd        	| U
+rcmd_af  	| U X
+rcmd        	| U X
 readdir  	| race:dirstream
-re_comp         | U  // Obsolete; use regcomp() instead
-re_exec  	| U  // Obsolete; use regexec() instead
+readdir_r       | Oreaddir  // Deprecated by glibc.  It is recommended to   \
+                               use plain readdir() instead due to various   \
+                               limitations, and modern implementations of   \
+                               readdir tend to be thread-safe if concurrent \
+                               calls use different directory streams
+readdir64       | race:dirstream
+readdir64_r     |
+re_comp         | U  Oregcomp X
+re_exec  	| U  Oregexec X
 regcomp  	| locale
 regerror  	| env
 regexec  	| locale
-res_nclose  	| locale
-res_ninit  	| locale
-res_nquerydomain| locale
-res_nquery  	| locale
-res_nsearch  	| locale
-res_nsend  	| locale
-rexec_af  	| U  // Obsolete; use rcmd() instead
-rexec  	        | U  // Obsolete; use rcmd() instead
-rpmatch         | LC_MESSAGES locale
-ruserok_af  	| locale
-ruserok  	| locale
+res_nclose  	| locale X
+res_ninit  	| locale X
+res_nquerydomain| locale X
+res_nquery  	| locale X
+res_nsearch  	| locale X
+res_nsend  	| locale X
+rexec_af  	| U  Orcmd X
+rexec  	        | U  Orcmd X
+rpmatch         | LC_MESSAGES locale X
+ruserok_af  	| locale X
+ruserok  	| locale X
 
 scanf, fscanf,  | locale LC_NUMERIC
 sscanf, vscanf,
 vsscanf, vfscanf
 
-setaliasent  	| locale
+setaliasent  	| locale X
 setenv, unsetenv| const:env
 sethostid  	| const:hostid
 
 #ifndef WIN32
-setlocale  	| race const:locale env
+setlocale  	| race const:locale env PPerl_setlocale
+setlocale_r  	| const:locale env O X PPerl_setlocale
 #endif
 
 setlogmask  	| race:LogMask
 setnetent  	| race:netent env locale
-setrpcent  	| locale
-setusershell  	| U
-setutent        | race:utent Osetutxent
+setnetent_r  	| race:netent env locale O X
+setrpcent  	| locale X
+setusershell  	| U X
+setutent        | race:utent Osetutxent X
 setutxent       | race:utent
-sgetspent_r  	| locale
-sgetspent  	| race:sgetspent
+sgetspent  	| race:sgetspent X
+sgetspent_r  	| locale X
 shm_open, shm_unlink| locale
 siginterrupt  	| const:sigintr                                             \
-                  // Obsolete; use sigaction(2) with the SA_RESTART flag    \
-                     instead
+                  O"Use sigaction(2) with the SA_RESTART flag instead"
 sleep       	| sig:SIGCHLD/linux
-ssignal  	| sigintr
+ssignal  	| sigintr O X
 
 strcasecmp,     | locale LC_CTYPE LC_COLLATE                                \
-                  // The POSIX Standard says results are undefined unless   \
+strncasecmp     | // The POSIX Standard says results are undefined unless   \
                      LC_CTYPE is the POSIX locale
-strncasecmp
 
-strcasestr  	| locale
+strcasestr  	| locale X
 strcoll, wcscoll| locale LC_COLLATE
 
 strerror        | race:strerror LC_MESSAGES
@@ -1359,8 +1661,7 @@ strfromd,       | locale LC_NUMERIC  // Asynchronous unsafe
 strfromf, strfroml
 
 strftime  	| race:tzset env locale LC_TIME                             \
-                  // Use Perl_sv_strftime_tm() or Perl_sv_strftime_ints()   \
-                     instead
+                  PPerl_sv_strftime_tm,Perl_sv_strftime_ints
 
 strftime_l  	| LC_TIME
 strptime  	| env locale LC_TIME
@@ -1371,21 +1672,17 @@ strtof,
 strtold
 
 strtoimax  	| locale
-strtok  	| race:strtok                                               \
-                  // To avoid needing to lock, use strtok_r() instead
+strtok  	| race:strtok Pstrtok_r
 wcstod, wcstold,| locale LC_NUMERIC
 wcstof
 
-strtol, 	| locale LC_NUMERIC
-strtoll,
-strtoq
+strtol, strtoll | locale LC_NUMERIC
+strtoq, strtouq | locale LC_NUMERIC X
+strtoul, strtoull| locale LC_NUMERIC
 
-strtoul, 	| locale LC_NUMERIC
-strtoull,
-strtouq
 
 strtoumax  	| locale
-strverscmp      | LC_COLLATE
+strverscmp      | LC_COLLATE X
 strxfrm  	| locale LC_COLLATE LC_CTYPE
 wcsxfrm         | locale LC_COLLATE LC_CTYPE
 swapcontext  	| race:oucp race:ucp
@@ -1396,27 +1693,27 @@ system          | // Some implementations are not-thread safe; See POSIX    \
                      Standard
 #endif
 
-syslog, vsyslog | env locale
+syslog          | env locale
 
 tdelete, 	| race:rootp
 tfind,
 tsearch
 
 tempnam  	| env Omkstemp,tmpfile
-timegm  	| env locale
-timelocal  	| env locale
+timegm  	| env locale X
+timelocal  	| env locale X
 tmpnam  	| race:tmpnam/!s Omkstemp,tmpfile
-toupper, tolower,| LC_CTYPE                                                 \
-                   // Use one of the Perl toUPPER family of macros instead
-toupper_l, tolower_l
+tmpnam_r  	| Omkstemp,tmpfile X
+tolower, tolower_l| LC_CTYPE PFtoLOWER
+toupper, toupper_l| LC_CTYPE PFtoUPPER
 towctrans       | LC_CTYPE
-towlower, towupper| locale LC_CTYPE                                         \
-                   // Use one of the Perl toLOWER family of macros
-towlower_l, towupper_l| LC_CTYPE
-ttyname  	| race:ttyname  // Use ttyname_r() instead
-ttyslot  	| U
+towlower, towlower_l| LC_CTYPE PFtoLOWER
+towupper, towupper_l| LC_CTYPE PFtoUPPER
+ttyname  	| race:ttyname  Pttyname_r 
+ttyname_r  	|
+ttyslot  	| U X
 twalk  	        | race:root
-twalk_r  	| race:root  // GNU extension
+twalk_r  	| race:root X
 
 // The POSIX Standard says:
 //
@@ -1441,31 +1738,32 @@ tzname, daylight,| V race:tzset
 timezone
 
 ungetwc         | LC_CTYPE
-updwtmp  	| sig:ALRM timer  // Not in POSIX Standard
-utmpname  	| race:utent
+updwtmp  	| sig:ALRM timer X
+utmpname  	| race:utent X
 
 // khw believes that this function is thread-safe if called with a per-thread
 // argument
-va_arg  	| race:ap/arg-ap-is-locale-to-its-thread
+va_arg  	| race:ap/arg-ap-is-local-to-its-thread
 
-vasprintf  	| locale
-verr  	        | locale
-verrx       	| locale
-vwarn       	| locale
-vwarnx  	| locale
-warn        	| locale
-warnx       	| locale
+verr  	        | locale X
+verrx       	| locale X
+versionsort     | locale X
+vsyslog         | env locale X
+vwarn       	| locale X
+vwarnx  	| locale X
+warn        	| locale X
+warnx       	| locale X
 wcrtomb  	| race:wcrtomb/!ps LC_CTYPE
-wcscasecmp  	| locale LC_CTYPE  // Not in POSIX; not widely implemented
-wcsncasecmp  	| locale LC_CTYPE  // Not in POSIX; not widely implemented
+wcscasecmp  	| locale LC_CTYPE
+wcsncasecmp  	| locale LC_CTYPE
 wcsnrtombs  	| race:wcsnrtombs/!ps LC_CTYPE
 wcsrtombs  	| race:wcsrtombs/!ps LC_CTYPE
 wcstoimax  	| locale
 wcstombs        | LC_CTYPE
 wcstoumax  	| locale
 wcswidth  	| locale LC_CTYPE
-wctob           | LC_CTYPE  // Use wcrtomb() instead
-wctomb  	| race LC_CTYPE
+wctob           | LC_CTYPE  Pwctomb,wcrtomb
+wctomb  	| race LC_CTYPE Pwcrtomb
 wctrans  	| locale LC_CTYPE
 wctype  	| locale LC_CTYPE
 wcwidth  	| locale LC_CTYPE

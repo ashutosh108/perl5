@@ -232,7 +232,7 @@ Perl_safesysrealloc(Malloc_t where,MEM_SIZE size)
 #endif
 
     if (size && size > 0x10CFC20000) {
-        int khw = 0;
+        //int khw = 0;
     }
     if (!size) {
         safesysfree(where);

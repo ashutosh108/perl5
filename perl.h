@@ -6509,12 +6509,16 @@ EXTCONST U8   PL_deBruijn_bitpos_tab64[];
     STMT_START {                                                            \
         CLANG_DIAG_IGNORE(-Wthread-safety)                                  \
         if (LIKELY(wcounter <= 0)) {                                        \
-            assert(wcounter == 0);                                          \
             UNLESS_PERL_MEM_LOG(DEBUG_U(PerlIO_printf(Perl_debug_log,      \
                                 "%s: %d: locking " name "; new lock depth=1"\
                                 "; this thread reader count=%d\n",          \
                                 __FILE__, __LINE__, rcounter));             \
             )                                                               \
+            if (wcounter != 0) (Perl_croak_nocontext("panic: " \
+                                "%s: %d: locking " name "; new lock depth=%d"\
+                                "; this thread reader count=%d\n",          \
+                                __FILE__, __LINE__, wcounter, rcounter));             \
+            assert(wcounter == 0);                                          \
                                                                             \
             /* If this thread has no read-locks on this mutex, it is a      \
              * simple write lock */                                         \
@@ -6595,12 +6599,16 @@ EXTCONST U8   PL_deBruijn_bitpos_tab64[];
     STMT_START {                                                            \
         CLANG_DIAG_IGNORE(-Wthread-safety)                                  \
         if (wcounter <= 0) {                                                \
-            assert(wcounter == 0);                                          \
             UNLESS_PERL_MEM_LOG(DEBUG_U(PerlIO_printf(Perl_debug_log,      \
                                 "%s: %d: read-locking " name "; no"         \
                                 " writers\n",                               \
                                 __FILE__, __LINE__));                       \
             )                                                               \
+            if (wcounter != 0) Perl_croak_nocontext("panic: " \
+                                "%s: %d: read-locking " name "; "         \
+                                " writers=%d\n",                               \
+                                __FILE__, __LINE__, wcounter);                       \
+            assert(wcounter == 0);                                          \
             PERL_READ_LOCK(mutex);                                          \
             (rcounter)++;                                                   \
             UNLESS_PERL_MEM_LOG(DEBUG_U(PerlIO_printf(Perl_debug_log,      \
@@ -6627,12 +6635,16 @@ EXTCONST U8   PL_deBruijn_bitpos_tab64[];
     STMT_START {                                                            \
         CLANG_DIAG_IGNORE(-Wthread-safety)                                  \
         if (wcounter <= 0) {                                                \
-            assert(wcounter == 0);                                          \
             UNLESS_PERL_MEM_LOG(DEBUG_U(PerlIO_printf(Perl_debug_log,      \
                                 "%s: %d: read-unlocking " name "; no"       \
                                 " writers; this thread reader count=%d\n",  \
                                 __FILE__, __LINE__, rcounter));             \
             )                                                               \
+            if (wcounter != 0) Perl_croak_nocontext("panic: " \
+                                "%s: %d: read-unlocking " name "; "       \
+                                " writers=%d; this thread reader count=%d\n",  \
+                                __FILE__, __LINE__, wcounter, rcounter);             \
+            assert(wcounter == 0);                                          \
             PERL_READ_UNLOCK(mutex);                                        \
             (rcounter)--;                                                   \
             UNLESS_PERL_MEM_LOG(DEBUG_U(PerlIO_printf(Perl_debug_log,      \
@@ -7481,7 +7493,7 @@ typedef struct am_table_short AMTS;
     /* The locale write-locks do need an exclusive locale mutex.  Treat them as
      * the (repurposed) generic lock */
 #  define LCx_LOCK_(m)                  GENx_LOCK_
-#  define LCx_UNLOCK_(m)                GENx_LOCK_
+#  define LCx_UNLOCK_(m)                GENx_UNLOCK_
 
 #  define ENVr_LCx_LOCK_(m)             GENx_ENVr_LOCK_
 #  define ENVr_LCx_UNLOCK_(m)           GENx_ENVr_UNLOCK_
@@ -7611,10 +7623,10 @@ typedef struct am_table_short AMTS;
 
 #  else
 
-     /* Here, are emulating safe locales; everything has to be treated as a
-      * write lock, as everything is done in the global locale, so we can't
-      * have another thread changing it, and this thread may well have to
-      * toggle the locale */
+     /* When emulating safe locales; all locale locks must be treated as write
+      * ones, as everything is done in the global locale, so we can't have
+      * another thread changing it, and this thread may well have to toggle the
+      * locale */
 #    define ENVr_LCr_LOCK_(m)           ENVr_LCx_LOCK_(m)
 #    define ENVr_LCr_UNLOCK_(m)         ENVr_LCx_UNLOCK_(m)
 
